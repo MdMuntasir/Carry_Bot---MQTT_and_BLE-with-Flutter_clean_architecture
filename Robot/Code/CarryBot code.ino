@@ -4,6 +4,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h> 
 #include <ESP32Servo.h>
+#include "soc/rtc.h"
 #include <HX711.h>
 
 #define distanceTrig 33
@@ -27,11 +28,21 @@
 
 
 
-int highSpeed = 200;  
+int highSpeed = 255;  
 int lowSpeed = 100;  
 
-const int PWM_FREQ = 1000;  // PWM frequency in Hz
+const int PWM_FREQ = 1000;  
 const int PWM_RESOLUTION = 8;
+
+
+// Constants for object following
+#define MIN_DISTANCE 5.0     
+#define MAX_DISTANCE 30.0     
+#define MIN_DEPTH 2.0     
+#define MAX_DEPTH 6.0
+#define SERVO_STEP 5          
+#define SERVO_MIN 0           
+#define SERVO_MAX 180  
 
 
 
@@ -126,31 +137,31 @@ void moveCar(String command) {
       Serial.println("Turning left");
   }
   else if (command == "fl") {
-      setMotor(motor1A, motor1B, 0, false);      // Stop
-      setMotor(motor2A, motor2B, highSpeed, true);  // Front-right forward
-      setMotor(motor3A, motor3B, 0, false);      // Stop
-      setMotor(motor4A, motor4B, highSpeed, true);  // Rear-right forward
+      setMotor(motor1A, motor1B, 0, true);      
+      setMotor(motor2A, motor2B, highSpeed, true); 
+      setMotor(motor3A, motor3B, 0, true);      
+      setMotor(motor4A, motor4B, highSpeed, true);  
       Serial.println("Front-right diagonal");
   }
   else if (command == "fr") {
-      setMotor(motor1A, motor1B, highSpeed, true);  // Front-left forward
-      setMotor(motor2A, motor2B, 0, false);      // Stop
-      setMotor(motor3A, motor3B, highSpeed, true);  // Rear-left forward
-      setMotor(motor4A, motor4B, 0, false);      // Stop
+      setMotor(motor1A, motor1B, highSpeed, true);  
+      setMotor(motor2A, motor2B, 0, true);      
+      setMotor(motor3A, motor3B, highSpeed, true); 
+      setMotor(motor4A, motor4B, 0, true);      
       Serial.println("Front-left diagonal");
   }
   else if (command == "bl") {
-      setMotor(motor1A, motor1B, 0, false);      // Stop
-      setMotor(motor2A, motor2B, highSpeed, false);      // Stop
-      setMotor(motor3A, motor3B, 0, false);      // Stop
-      setMotor(motor4A, motor4B, highSpeed, false); // Rear-right backward
+      setMotor(motor1A, motor1B, 0, false);     
+      setMotor(motor2A, motor2B, highSpeed, false);
+      setMotor(motor3A, motor3B, 0, false);      
+      setMotor(motor4A, motor4B, highSpeed, false);
       Serial.println("Back-right reverse");
   }
   else if (command == "br") {
-      setMotor(motor1A, motor1B, highSpeed, false);      // Stop
-      setMotor(motor2A, motor2B, 0, false);      // Stop
-      setMotor(motor3A, motor3B, highSpeed, false); // Rear-left backward
-      setMotor(motor4A, motor4B, 0, false);      // Stop
+      setMotor(motor1A, motor1B, highSpeed, false);
+      setMotor(motor2A, motor2B, 0, false);      
+      setMotor(motor3A, motor3B, highSpeed, false);
+      setMotor(motor4A, motor4B, 0, false);      
       Serial.println("Back-left reverse");
   }
   else if (command == "stop"){
@@ -165,63 +176,112 @@ void moveCar(String command) {
 }
 
 
+// Send message as the robot
+void sendMessage(const char* message){
+        StaticJsonDocument<200> jsonDoc;
+        jsonDoc["message"] = message;
 
-// Object detection system
-void sideDetector(){
-  int leftSide = !digitalRead(leftPin);
-  int rightSide = !digitalRead(rightPin);
-  Serial.println(rightSide);
+        // Convert JSON to string
+        String jsonString;
+        serializeJson(jsonDoc, jsonString);
 
-  if(leftSide && left == false){
-    left = true;
-  }
-  else{
-    if(left){
-      left = false;
-    }
-  }
-  if(rightSide && right == false){
-      right = true;
-  }
-  else{
-    if(right){
-      right = false;
-    }
-  }
-
+        // Send JSON over BLE if a device is connected
+        if (deviceConnected) {
+            pCharacteristic->setValue(jsonString.c_str());  
+            pCharacteristic->notify();  
+            Serial.print("📤 Sent JSON via BLE: ");
+            Serial.println(jsonString);
+        } else {
+            Serial.println("⚠️ No BLE device connected.");
+        }
 }
 
 
 
-void objctDetector(float distance){
+// Side IR sensor detection
+void sideDetector() {
+  left = !digitalRead(leftPin);
+  right = !digitalRead(rightPin);
+
+  // Update servo angle based on IR sensor readings
+  if (left && !right) {
+    // Object detected on left, gradually turn servo left
+    servoAngle = max(servoAngle - SERVO_STEP, SERVO_MIN);
+    for(int i=0; i<5; i++)  
+      moveCar("left");
+  } else if (right && !left) {
+    // Object detected on right, gradually turn servo right
+    servoAngle = min(servoAngle + SERVO_STEP, SERVO_MAX);
+    for(int i=0; i<5; i++)
+      moveCar("right");
+  }
+
+  servo.write(servoAngle);
+}
+
+int autoPrePhase = 0;
+int autoCurrentPhase = 0;
+
+// Automatic object-following function
+void autoFollowObject(float distance) {
   sideDetector();
+  Serial.print(" | Distance: "); Serial.print(distance);
+  Serial.print(" | Servo Angle: "); Serial.println(servoAngle);
 
-  Serial.print("Left: "); Serial.print(left);Serial.print(" | ");
-  Serial.print("Right: "); Serial.print(right); Serial.print(" | ");
-  Serial.println(distance);
-
-  servoPastVal = servoAngle;
-  if(left || right){
-    if(left && !right && servoAngle<180){
-      servo.write(servoAngle++);
-    }
-    else if(right && !left && servoAngle>0){
-      servo.write(servoAngle--);
+  // Object too close: stop to avoid collision
+  if (distance < MIN_DISTANCE) {
+    autoCurrentPhase = 1;
+    moveCar("stop");
+    if(autoPrePhase != autoCurrentPhase){
+      autoPrePhase = autoCurrentPhase;
+      sendMessage("Too close, stopping");
     }
     
+    return;
   }
-  else{
-    if(servoAngle >= 0 && servoPastVal>servoAngle){
-      servo.write(servoAngle--);
+
+  // Object within following distance range
+  if (distance >= MIN_DISTANCE && distance <= MAX_DISTANCE) {
+    // Check if the head is centered on the object
+    if (servoAngle >= (90 - SERVO_STEP) && servoAngle <= (90 + SERVO_STEP)) {
+      autoCurrentPhase = 2;
+      // Head is centered, move the car forward
+      moveCar("front");
+      if(autoPrePhase != autoCurrentPhase){
+        autoPrePhase = autoCurrentPhase;
+        sendMessage("Head centered, moving forward"); 
       }
-    else if(servoAngle <= 180 && servoPastVal<servoAngle)
-      servo.write(servoAngle++);
-    else if(servoPastVal == 0 && servoAngle == 0)
-      servo.write(servoAngle++);
-    else if(servoPastVal == 180 && servoAngle == 180)
-      servo.write(servoAngle--);
+      
+    } else {
+      autoCurrentPhase = 3;
+      // Head is not centered, stop the car and wait for sideDetector to center it
+      moveCar("stop");
+      if(autoPrePhase != autoCurrentPhase){
+        autoPrePhase = autoCurrentPhase;
+        sendMessage("Head not centered, stopping car to center head");
+      }
+      
+    }
   }
-  delay(10);
+  // Object lost: scan with servo
+  else if (distance > MAX_DISTANCE) {
+    autoCurrentPhase = 4;
+    moveCar("stop");
+    if(autoPrePhase != autoCurrentPhase){
+      autoPrePhase = autoCurrentPhase;
+      sendMessage("Object lost, scanning");
+    }
+    
+    // Scan left or right based on last known direction
+    if (servoAngle > servoPastVal && servoAngle < 180 || servoAngle<=0) {
+      servoPastVal =  servoAngle;
+      servoAngle += SERVO_STEP;
+    } else {
+      servoPastVal =  servoAngle;
+      servoAngle -= SERVO_STEP;
+    }
+    servo.write(servoAngle);
+  }
 }
 
 
@@ -265,11 +325,33 @@ void parseJson(String jsonString) {
   const char* move = doc["move"];
   const char* mode = doc["mode"];
   if (move) {
+    float depth = getDepth();
+    float distance = getDistance();
+
+    if(move == "front"){
+      if(depth > MAX_DEPTH || distance < MIN_DISTANCE) {
+        if(depth> MAX_DEPTH ){
+          sendMessage("I can't cross this depth");
+        }
+        if(distance< MIN_DISTANCE){
+          sendMessage("I will crash if I go further");
+        }
+        stopCar(10); 
+      }
+      else
+      moveCar(move);
+    }
+    else
     moveCar(move);
   } 
   
   else if(mode){
-    manualControl = mode == "manual";
+    stopCar(10);
+    manualControl = strcmp(mode,"manual") == 0;
+    Serial.print("Mode: ");
+    Serial.println(mode);
+    manualControl?
+    sendMessage("Manual Mode") : sendMessage("Auto Mode");
   }
 
   else {
@@ -434,7 +516,7 @@ float getDistance() {
     digitalWrite(distanceTrig, LOW);
     delayMicroseconds(2);
     digitalWrite(distanceTrig, HIGH);
-    delayMicroseconds(10);
+    delayMicroseconds(8);
     digitalWrite(distanceTrig, LOW);
 
     long duration = pulseIn(distanceEcho, HIGH);
@@ -446,12 +528,12 @@ float getDepth(){
     digitalWrite(depthTrig, LOW);
     delayMicroseconds(2);
     digitalWrite(depthTrig, HIGH);
-    delayMicroseconds(10);
+    delayMicroseconds(5);
     digitalWrite(depthTrig, LOW);
 
     long duration = pulseIn(depthEcho, HIGH);
-    float distance = duration * 0.034 / 2; // Convert to cm
-    return distance;
+    float depth = duration * 0.034 / 2; // Convert to cm
+    return depth;
 }
 
 float getWeight(){
@@ -464,20 +546,18 @@ float getWeight(){
   }
 }
 
-void sendSensorData(){
+void sendSensorData(float distance, float depth){
   StaticJsonDocument<300> jsonArray;
     JsonArray data = jsonArray.createNestedArray("sensors");
 
-    float distance = getDistance();
-    float depth = getDepth();
     float weight =  getWeight();
 
     
     JsonObject sensor1 = data.createNestedObject();
-    sensorJson(sensor1, "Distance Sensor",distance,getSituation(10,50,1,distance));
+    sensorJson(sensor1, "Distance Sensor",distance,getSituation(MIN_DISTANCE, MAX_DISTANCE, 5, distance));
 
     JsonObject sensor2 = data.createNestedObject(); 
-    sensorJson(sensor2, "Depth Sensor",depth,getSituation(10,30,5,depth));
+    sensorJson(sensor2, "Depth Sensor",depth,getSituation(MIN_DEPTH, MAX_DEPTH, 0, depth));
 
     JsonObject sensor3 = data.createNestedObject(); 
     sensorJson(sensor3, "Weight Sensor",weight,getSituation(0,10000,500,weight));
@@ -495,7 +575,6 @@ void sendSensorData(){
         pCharacteristic->notify();
     }
 }
-
 
 
 
@@ -555,14 +634,6 @@ void testMotors() {
 }
 
 
-void testMotorSpeed(int channel){
-  Serial.print("Testing channel: ");Serial.println(channel);
-    ledcWrite(channel, 200);  // Channel 0
-    delay(2000);
-    ledcWrite(channel, 0);
-    delay(1000);
-
-}
 
 
 
@@ -583,15 +654,14 @@ void pinInit(){
   pinMode(rightPin, INPUT_PULLUP);
 
   //For Motors
-  // Configure and attach PWM channels to pins
   ledcAttach(motor1A, PWM_FREQ, PWM_RESOLUTION);
   ledcAttach(motor1B, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttach(motor2A, PWM_FREQ, PWM_RESOLUTION); // 4
-  ledcAttach(motor2B, PWM_FREQ, PWM_RESOLUTION); // 15
+  ledcAttach(motor2A, PWM_FREQ, PWM_RESOLUTION); 
+  ledcAttach(motor2B, PWM_FREQ, PWM_RESOLUTION); 
   ledcAttach(motor3A, PWM_FREQ, PWM_RESOLUTION); 
   ledcAttach(motor3B, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttach(motor4A, PWM_FREQ, PWM_RESOLUTION); // 18
-  ledcAttach(motor4B, PWM_FREQ, PWM_RESOLUTION); // 5
+  ledcAttach(motor4A, PWM_FREQ, PWM_RESOLUTION); 
+  ledcAttach(motor4B, PWM_FREQ, PWM_RESOLUTION); 
   stopMotors();
 
 
@@ -607,53 +677,45 @@ void setup() {
   servoInit();
 }
 
+
+int sensorSendDelay = 10;
+int objectFollowDelay = 2;
+
+
+
 void loop() {
+  if(deviceConnected){
+    float depth = getDepth();
+    float distance = getDistance();
 
-  //   if (scale.is_ready()) {
-  //   long reading = scale.get_units(3);
-  //   Serial.print("weight: ");
-  //   Serial.println(reading);
-  //   delay(10);
-  // } 
-  // else {
-  //   Serial.println("HX711 not found.");
-  // }
-  // delay(100);
-  // delay(2000);
+    Serial.print("Distance: ");
+    Serial.print(distance);
+    Serial.print(" | Depth: ");
+    Serial.println(depth);
 
-  if (Serial.available()) {  
-        String inputMessage = Serial.readString(); 
-        // Serial.print("first part : ");
-        Serial.println(inputMessage);
-        // moveCar(inputMessage);
-        servo.write(inputMessage.toInt());
-        // testMotorSpeed(inputMessage.toInt());
 
-        // StaticJsonDocument<200> jsonDoc;
-        // jsonDoc["message"] = inputMessage;
-
-        // // Convert JSON to string
-        // String jsonString;
-        // serializeJson(jsonDoc, jsonString);
-
-        // // Send JSON over BLE if a device is connected
-        // if (deviceConnected) {
-        //     pCharacteristic->setValue(jsonString.c_str());  
-        //     pCharacteristic->notify();  
-        //     Serial.print("📤 Sent JSON via BLE: ");
-        //     Serial.println(jsonString);
-        // } else {
-        //     Serial.println("⚠️ No BLE device connected.");
-        // }
+    if (!manualControl) {
+      if(objectFollowDelay < 2)
+        objectFollowDelay++;
+      
+      else{
+        autoFollowObject(distance);
+        objectFollowDelay = 1;
+      }
     }
 
-    // sendSensorData();
-    // delay(100);
 
-    objctDetector(getDistance());
-    // sideDetector();
+    if(sensorSendDelay < 5){
+      sensorSendDelay++;
+    }else{
+      sendSensorData(distance, depth);
+      sensorSendDelay = 1;
+    }
+    
+    delay(10);
+  
+  }
 
-    // moveCar("front");
-    // delay(1000);
+
 
 }
